@@ -1518,7 +1518,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not isinstance(payload, dict):
             return web.Response(status=400)
 
-        await self._dispatch_payload(payload)
+        if await self._dispatch_payload(payload) is False:
+            return web.Response(status=503)
         return web.Response(status=200)
 
     # ------------------------------------------------------------------ signature
@@ -1555,20 +1556,23 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         already in the in-memory cache. Cache is FIFO-evicted at
         ``WAMID_DEDUP_CACHE_SIZE``.
         """
-        if not wamid:
-            # No wamid means we can't dedup — let it through. Meta should
-            # always populate ``id``, but be defensive.
-            return True
-        if wamid in self._seen_wamids:
+        if self._has_seen_wamid(wamid):
             self._duplicate_count += 1
             return False
-        self._seen_wamids[wamid] = True
-        # Trim oldest entries to stay under the cap.
-        while len(self._seen_wamids) > WAMID_DEDUP_CACHE_SIZE:
-            self._seen_wamids.popitem(last=False)
+        self._remember_wamid(wamid)
         return True
 
-    async def _dispatch_payload(self, payload: Dict[str, Any]) -> None:
+    def _has_seen_wamid(self, wamid: str) -> bool:
+        return bool(wamid) and wamid in self._seen_wamids
+
+    def _remember_wamid(self, wamid: str) -> None:
+        if not wamid:
+            return
+        self._seen_wamids[wamid] = True
+        while len(self._seen_wamids) > WAMID_DEDUP_CACHE_SIZE:
+            self._seen_wamids.popitem(last=False)
+
+    async def _dispatch_payload(self, payload: Dict[str, Any]) -> bool:
         """Walk a verified Meta webhook payload and dispatch each message.
 
         Payload shape (truncated):
@@ -1585,7 +1589,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "[whatsapp_cloud] ignoring non-WABA payload (object=%r)",
                 payload.get("object"),
             )
-            return
+            return True
         for entry in payload.get("entry") or []:
             if not isinstance(entry, dict):
                 continue
@@ -1616,7 +1620,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if not isinstance(raw_message, dict):
                         continue
                     wamid = str(raw_message.get("id") or "").strip()
-                    if not self._dedup_wamid(wamid):
+                    if self._has_seen_wamid(wamid):
+                        self._duplicate_count += 1
                         logger.debug(
                             "[whatsapp_cloud] duplicate wamid %s, skipping",
                             wamid,
@@ -1627,19 +1632,27 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             raw_message, contacts_by_waid, metadata
                         )
                     except Exception:
-                        # Build errors must not bubble out either: the wamid
-                        # is already dedup-marked above, so a 500 here would
-                        # make Meta retry the batch and every message in it
-                        # (including this one) would be silently dropped as
-                        # a duplicate. Log and move on to the next message.
+                        self._remember_wamid(wamid)
                         logger.exception(
                             "[whatsapp_cloud] failed to build event for wamid %s",
                             wamid,
                         )
                         continue
                     if event is None:
+                        self._remember_wamid(wamid)
                         continue
+                    try:
+                        startup_handled = await self._preflight_startup_gate(event)
+                    except Exception:
+                        logger.exception(
+                            "[whatsapp_cloud] startup admission failed for wamid %s",
+                            wamid,
+                        )
+                        return False
+                    self._remember_wamid(wamid)
                     self._accepted_count += 1
+                    if startup_handled:
+                        continue
                     try:
                         await self.handle_message(event)
                     except Exception:
@@ -1659,6 +1672,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             status.get("status"),
                             status.get("id"),
                         )
+        return True
 
     async def _dispatch_interactive_reply(
         self,

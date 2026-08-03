@@ -3354,6 +3354,54 @@ class SessionStore:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def replay_marker_status(
+        self, session_id: str, platform_message_id: str
+    ) -> bool:
+        if not self._db:
+            raise RuntimeError("canonical session database is unavailable")
+        if not platform_message_id:
+            raise ValueError("platform message id is required")
+        return self._db.has_platform_message_id(session_id, platform_message_id)
+
+    def replay_marker_status_for_session_key(
+        self,
+        session_key: str,
+        platform_message_id: str,
+    ) -> bool:
+        if not self._db:
+            raise RuntimeError("canonical session database is unavailable")
+        if not session_key:
+            raise ValueError("session key is required")
+        if not platform_message_id:
+            raise ValueError("platform message id is required")
+        return self._db.has_platform_message_id_for_session_key(
+            session_key,
+            platform_message_id,
+        )
+
+    def persist_replay_marker(
+        self,
+        session_id: str,
+        platform_message_id: str,
+        *,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        db = self._db
+        if not db:
+            raise RuntimeError("canonical session database is unavailable")
+        if not platform_message_id:
+            raise ValueError("platform message id is required")
+        if db.has_platform_message_id(session_id, platform_message_id):
+            return True
+        db.append_message(
+            session_id=session_id,
+            role="session_meta",
+            content=None,
+            platform_message_id=platform_message_id,
+            timestamp=timestamp,
+        )
+        return db.has_platform_message_id(session_id, platform_message_id)
+
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> bool:
         """Replace the entire transcript for a session with new messages.
 

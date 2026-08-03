@@ -4527,7 +4527,7 @@ class GatewaySlashCommandsMixin:
             return "Usage: `/sessions search <query>`"
 
         if target:
-            resume_event = dataclasses.replace(event, text=f"/resume {target}")
+            resume_event = event.replaced(text=f"/resume {target}")
             return await self._handle_resume_command(resume_event)
 
         source = await asyncio.to_thread(

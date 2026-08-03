@@ -293,12 +293,23 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
                 if self._has_seen_receipt(receipt_key):
                     duplicates += 1
                     continue
-                self._remember_receipt(receipt_key)
 
+            event = self._build_message_event(notification, receipt_key)
+            try:
+                startup_handled = await self._preflight_startup_gate(event)
+            except Exception:
+                logger.exception(
+                    "[msgraph_webhook] startup admission failed for %s",
+                    receipt_key or "notification",
+                )
+                return web.Response(status=503)
+
+            if receipt_key is not None:
+                self._remember_receipt(receipt_key)
             accepted += 1
             self._accepted_count += 1
-            event = self._build_message_event(notification, receipt_key)
-            self._schedule_notification(notification, event)
+            if not startup_handled:
+                self._schedule_notification(notification, event)
 
         self._duplicate_count += duplicates
         # If anything ingested OR deduped, return 202 with empty body so
@@ -402,6 +413,8 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
             raw_message=notification,
             message_id=message_id,
             internal=True,
+            durable_ingress=True,
+            retry_transport_on_admission_failure=True,
         )
 
     def _render_prompt(self, notification: Dict[str, Any]) -> str:

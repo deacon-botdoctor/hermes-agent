@@ -1060,12 +1060,20 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
         )
+        try:
+            startup_handled = await self._preflight_startup_gate(event)
+        except Exception:
+            logger.exception("[bluebubbles] startup admission failed")
+            return web.Response(text="retry", status=503)
+
+        if self.send_read_receipts and session_chat_id:
+            asyncio.create_task(self.mark_read(session_chat_id))
+
+        if startup_handled:
+            return web.Response(text="ok")
+
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
-
-        # Fire-and-forget read receipt
-        if self.send_read_receipts and session_chat_id:
-            asyncio.create_task(self.mark_read(session_chat_id))
 
         return web.Response(text="ok")

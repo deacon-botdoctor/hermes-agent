@@ -40,7 +40,10 @@ import sys
 import signal
 import threading
 import time
+import sqlite3
+import uuid
 from collections import OrderedDict
+from contextlib import nullcontext
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
@@ -83,6 +86,16 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+
+
+@dataclasses.dataclass(frozen=True)
+class _StartupGateDecision:
+    response: str
+    durable_accepted: bool
+    drain_pending: bool = False
+    queue_id: Optional[str] = None
+    receipt_state: Optional[str] = None
+
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -219,6 +232,12 @@ _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
 def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     """True only for programmatic/local surfaces that must keep raw text."""
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
+
+
+def _event_bypasses_startup_gate(event: "MessageEvent") -> bool:
+    return bool(getattr(event, "internal", False)) and not bool(
+        getattr(event, "durable_ingress", False)
+    )
 
 
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
@@ -949,13 +968,8 @@ def build_resume_recovery_note(
     startup auto-resume turn synthesized by
     ``_schedule_resume_pending_sessions`` with no human message attached.
 
-    ``interactive`` selects the empty-message guidance: on interactive
-    platforms a human is present, so "report the restore and ask what next"
-    is right.  On non-interactive event platforms (webhook, API server —
-    adapters with ``interactive_resume = False``) nobody can answer; the
-    resumed turn must instead complete the interrupted work, or the task is
-    silently abandoned behind a "restored" acknowledgement that goes
-    nowhere (#57056).
+    Empty startup resumes are human check-ins. Generic interrupted work is
+    never restarted without a new user instruction.
     """
     reason_phrase = (
         "a gateway restart"
@@ -984,15 +998,12 @@ def build_resume_recovery_note(
         )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
-            "CONTINUE the interrupted task to completion."
+            "Report that the interrupted session is available for a new "
+            "instruction, without continuing its prior work."
         )
         tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step "
-            "that has no recorded result."
+            "Do NOT re-execute old tool calls or continue unfinished work "
+            "from the conversation history."
         )
     return (
         f"[System note: The previous turn was interrupted by "
@@ -2248,6 +2259,25 @@ from gateway.delivery import (
     resolve_delivery_transport,
 )
 from gateway.turn_lease import SessionTurnLeaseRegistry
+from gateway.drain_inbox import (
+    acquire_producer_replay_lease as acquire_drain_producer_replay_lease,
+    acquire_replay_lease as acquire_drain_replay_lease,
+    acknowledge as acknowledge_drain_event,
+    cancel_producer_replay_lease as cancel_drain_producer_replay_lease,
+    claim_pre_dispatch_event_result as claim_pre_dispatch_drain_event_result,
+    claim_event as claim_drain_event,
+    complete_event as complete_drain_event,
+    event_queue_id as get_drain_event_queue_id,
+    event_receipt as get_drain_event_receipt,
+    event_from_record as drain_event_from_record,
+    finalize_pre_dispatch_event_result as finalize_pre_dispatch_drain_event_result,
+    inbox_path as get_drain_inbox_path,
+    pending_records as pending_drain_records,
+    persist_event as persist_drain_event,
+    persist_event_result as persist_drain_event_result,
+    record_pre_dispatch_attempt_result as record_pre_dispatch_drain_attempt_result,
+    release_replay_lease as release_drain_replay_lease,
+)
 from gateway.session_state import (
     SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET,
     SessionState,
@@ -2261,6 +2291,7 @@ from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    MessageHandler,
     MessageEvent,
     MessageType,
     _prefix_within_utf16_limit,
@@ -5784,6 +5815,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.
         self._async_session_store = AsyncSessionStore(self.session_store)
+        # Capture the process-level home before multiplexed message handlers
+        # enter per-profile ContextVar scopes. One gateway process owns one
+        # drain inbox; records retain source.profile for replay routing.
+        self._drain_inbox_path = get_drain_inbox_path()
+        self._drain_inbox_producer_token = f"{os.getpid()}:{uuid.uuid4().hex}"
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -5886,16 +5922,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # / conversation boundary). See gateway.session_stall.
         self._session_stall_notified: Dict[str, bool] = {}
         # Startup restore gate: while restart-interrupted sessions are being
-        # auto-resumed, real inbound messages are queued instead of competing
-        # with the synthetic resume turns for the same session.  The queued
-        # events drain only after all startup resume tasks have finished.
+        # auto-resumed, real inbound messages are durably held instead of
+        # competing with the synthetic resume turns for the same session.
         self._startup_restore_in_progress = False
         # Set by start_gateway() only for an explicit ``--replace`` launch.
         # _connect_initial_adapter_with_timeout scopes it to each adapter's
         # cold-start connect and removes it before any reconnect can run.
         self._platform_lock_takeover_on_start = False
-        self._startup_restore_queue: List[MessageEvent] = []
+        self._startup_restore_barrier = asyncio.Lock()
         self._startup_restore_tasks: List[asyncio.Task] = []
+        self._drain_replay_outcomes: Dict[str, str] = {}
+        self._post_startup_drain_task: Optional[asyncio.Task] = None
         # LRU cache of live SessionSources keyed by session_key. Used by
         # fallback routing paths (shutdown notifications, synthetic
         # background-process events) when the persisted origin is missing
@@ -7523,11 +7560,141 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
 
-    def _queue_during_drain_enabled(self) -> bool:
-        # Both "queue" and "steer" modes imply the user doesn't want messages
-        # to be lost during restart — queue them for the newly-spawned gateway
-        # process to pick up.  "interrupt" mode drops them (current behaviour).
-        return self._restart_requested and self._busy_input_mode in {"queue", "steer"}
+    async def _persist_drain_event(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        reason: str,
+    ) -> bool:
+        """Persist drain-time work before promising that Hermes saved it."""
+        return bool(
+            await asyncio.to_thread(
+                persist_drain_event,
+                event,
+                session_key,
+                reason=reason,
+                path=getattr(self, "_drain_inbox_path", None),
+                producer_token=getattr(
+                    self,
+                    "_drain_inbox_producer_token",
+                    None,
+                ),
+            )
+        )
+
+    async def _persist_drain_event_result(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        reason: str,
+    ) -> tuple[Optional[str], str]:
+        return await asyncio.to_thread(
+            persist_drain_event_result,
+            event,
+            session_key,
+            reason=reason,
+            path=getattr(self, "_drain_inbox_path", None),
+            producer_token=getattr(
+                self,
+                "_drain_inbox_producer_token",
+                None,
+            ),
+        )
+
+    async def _claim_pre_dispatch_drain_event_result(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        reason: str,
+    ) -> tuple[Optional[str], str, bool]:
+        return await asyncio.to_thread(
+            claim_pre_dispatch_drain_event_result,
+            event,
+            session_key,
+            reason=reason,
+            path=getattr(self, "_drain_inbox_path", None),
+            producer_token=getattr(
+                self,
+                "_drain_inbox_producer_token",
+                None,
+            ),
+        )
+
+    async def _finalize_pre_dispatch_drain_event_result(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        handled: bool,
+        reason: str,
+    ) -> tuple[Optional[str], str]:
+        return await asyncio.to_thread(
+            finalize_pre_dispatch_drain_event_result,
+            event,
+            session_key,
+            handled=handled,
+            reason=reason,
+            path=getattr(self, "_drain_inbox_path", None),
+            producer_token=getattr(
+                self,
+                "_drain_inbox_producer_token",
+                None,
+            ),
+        )
+
+    async def _record_pre_dispatch_drain_attempt_result(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> tuple[Optional[str], str]:
+        return await asyncio.to_thread(
+            record_pre_dispatch_drain_attempt_result,
+            event,
+            session_key,
+            path=getattr(self, "_drain_inbox_path", None),
+            producer_token=getattr(
+                self,
+                "_drain_inbox_producer_token",
+                None,
+            ),
+        )
+
+    async def _persist_pending_followup_for_drain(
+        self,
+        pending_event: Optional[MessageEvent],
+        pending: Optional[str],
+        source: SessionSource,
+        session_key: Optional[str],
+    ) -> tuple[Optional[MessageEvent], Optional[str]]:
+        if not self._draining or not (pending_event or pending):
+            return pending_event, pending
+        drain_event = pending_event
+        if drain_event is None and pending:
+            drain_event = MessageEvent(
+                text=pending,
+                message_type=MessageType.TEXT,
+                source=source,
+            )
+        elif drain_event is not None and pending and drain_event.text != pending:
+            drain_event = drain_event.replaced(text=pending)
+        saved = bool(
+            drain_event is not None
+            and await self._persist_drain_event(
+                drain_event,
+                session_key or self._session_key_for_source(source),
+                reason="pending-followup-drain",
+            )
+        )
+        logger.info(
+            "%s pending follow-up for session %s during gateway %s",
+            "Persisted" if saved else "Could not persist",
+            session_key or "?",
+            self._status_action_label(),
+        )
+        return (None, None) if saved else (pending_event, pending)
 
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
@@ -7687,20 +7854,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # and the gateway re-accepts turns.
     # ------------------------------------------------------------------
     def _enter_external_drain(self) -> None:
-        """Begin external drain: stop accepting new turns, flip state.
+        """Begin external drain: queue new turns durably and flip state.
 
         Idempotent — re-entering while already draining is a no-op beyond a
         best-effort status re-write. In-flight turns are NOT interrupted (the
-        whole point is to let them finish); only NEW turns are refused.
+        whole point is to let them finish). New transport messages are accepted
+        into the durable drain inbox but cannot start executable work.
         """
         if self._external_drain_active:
             return
         self._external_drain_active = True
         logger.info(
-            "External drain ENGAGED (.drain_request.json present) — refusing "
-            "new turns; %d in-flight turn(s) will finish. Process stays up.",
+            "External drain ENGAGED (.drain_request.json present) — durably "
+            "queueing new turns; %d in-flight turn(s) will finish. Process stays up.",
             self._active_work_count(),
         )
+        maintenance_note = (
+            "Maintenance is pending. Finish the current atomic step and avoid "
+            "starting new delegated work. If the task cannot finish before the "
+            "deadline, persist a continuation checkpoint with the exact next "
+            "action and blockers."
+        )
+        for session_key, agent in list(getattr(self, "_running_agents", {}).items()):
+            if agent is _AGENT_PENDING_SENTINEL:
+                continue
+            steer = getattr(agent, "steer", None)
+            if callable(steer):
+                try:
+                    steer(maintenance_note)
+                except Exception:
+                    logger.debug(
+                        "Failed to steer maintenance intent into %s",
+                        session_key,
+                        exc_info=True,
+                    )
         # Flip the persisted lifecycle state so /api/status.gateway_busy /
         # gateway_drainable track the drain. Preserve active_agents (the
         # read-merge keeps the live count); only the state changes.
@@ -8492,6 +8679,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    def _get_startup_restore_barrier(self) -> asyncio.Lock:
+        barrier = getattr(self, "_startup_restore_barrier", None)
+        if barrier is None:
+            barrier = asyncio.Lock()
+            self._startup_restore_barrier = barrier
+        return barrier
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
@@ -8531,6 +8725,517 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._enqueue_fifo(session_key, event, adapter)
 
+    async def _persist_startup_gate_event(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[str]:
+        decision = await self._persist_startup_gate_event_decision(
+            event,
+            session_key,
+        )
+        return decision.response if decision is not None else None
+
+    async def _persist_startup_gate_event_decision(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[_StartupGateDecision]:
+        if (
+            not getattr(self, "_startup_restore_in_progress", False)
+            or _event_bypasses_startup_gate(event)
+            or getattr(event, "_hermes_startup_restore_replay", False)
+        ):
+            return None
+        if getattr(event, "_hermes_startup_gate_barrier_held", False):
+            return await self._persist_startup_gate_event_locked(
+                event,
+                session_key,
+            )
+        async with self._get_startup_restore_barrier():
+            if (
+                not getattr(self, "_startup_restore_in_progress", False)
+                or _event_bypasses_startup_gate(event)
+                or getattr(event, "_hermes_startup_restore_replay", False)
+            ):
+                return None
+            return await self._persist_startup_gate_event_locked(
+                event,
+                session_key,
+            )
+
+    async def _existing_startup_gate_decision(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[_StartupGateDecision]:
+        try:
+            queue_id = get_drain_event_queue_id(event, session_key)
+        except ValueError:
+            return None
+        local_outcome = getattr(self, "_drain_replay_outcomes", {}).get(
+            queue_id
+        )
+        if local_outcome == "running":
+            return _StartupGateDecision(
+                response=(
+                    "⏳ Hermes is already processing this saved instruction. "
+                    "It will not start it again."
+                ),
+                durable_accepted=True,
+            )
+        if local_outcome == "completed":
+            return _StartupGateDecision(
+                self._DRAIN_COMPLETED_NOTICE,
+                True,
+                drain_pending=True,
+                queue_id=queue_id,
+                receipt_state="completed",
+            )
+        receipt = await asyncio.to_thread(
+            get_drain_event_receipt,
+            event,
+            session_key,
+            getattr(self, "_drain_inbox_path", None),
+        )
+        state = (
+            str(receipt.get("state") or "queued")
+            if receipt is not None
+            else None
+        )
+        if state == "queued":
+            return _StartupGateDecision(
+                response=(
+                    "⏳ Gateway startup recovery is still finishing. "
+                    "Your message was saved and will run next."
+                ),
+                durable_accepted=True,
+                drain_pending=True,
+                queue_id=queue_id,
+                receipt_state=state,
+            )
+        if state == "handled":
+            return _StartupGateDecision(
+                "",
+                True,
+                drain_pending=True,
+                queue_id=queue_id,
+                receipt_state=state,
+            )
+        if state in {"claimed", "ambiguous"}:
+            if (
+                not getattr(event, "internal", False)
+                and not self._is_user_authorized(event.source)
+            ):
+                authorization_rejection = bool(
+                    receipt is not None
+                    and state == "claimed"
+                    and receipt.get("recovery_disposition")
+                    == "unauthorized-rejected"
+                )
+                if authorization_rejection:
+                    _queue_id, finalized_state = (
+                        await self._finalize_pre_dispatch_drain_event_result(
+                            event,
+                            session_key,
+                            handled=True,
+                            reason="startup-restore-unauthorized-rejected",
+                        )
+                    )
+                    if finalized_state in {"handled", "completed"}:
+                        return _StartupGateDecision(
+                            "",
+                            True,
+                            drain_pending=True,
+                            queue_id=queue_id,
+                            receipt_state=finalized_state,
+                        )
+                return _StartupGateDecision(
+                    "",
+                    state == "ambiguous",
+                    queue_id=queue_id,
+                    receipt_state=state,
+                )
+            return _StartupGateDecision(
+                self._DRAIN_UNCERTAIN_NOTICE,
+                True,
+                drain_pending=True,
+                queue_id=queue_id,
+                receipt_state=state,
+            )
+        if state == "completed":
+            return _StartupGateDecision(
+                self._DRAIN_COMPLETED_NOTICE,
+                True,
+                drain_pending=True,
+                queue_id=queue_id,
+                receipt_state=state,
+            )
+        session_store = getattr(self, "session_store", None)
+        if session_store is None:
+            return None
+        message_id = str(event.message_id or f"drain:{queue_id}")
+        if await self.async_session_store.replay_marker_status_for_session_key(
+            session_key,
+            message_id,
+        ):
+            return _StartupGateDecision("", True)
+        return None
+
+    async def _claim_startup_pre_dispatch_event_locked(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[_StartupGateDecision]:
+        _queue_id, state, acquired = (
+            await self._claim_pre_dispatch_drain_event_result(
+                event,
+                session_key,
+                reason="startup-restore-pre-dispatch",
+            )
+        )
+        if acquired:
+            setattr(event, "_hermes_pre_gateway_dispatch_claimed", True)
+            return None
+        if state == "queued":
+            return _StartupGateDecision(
+                response=(
+                    "⏳ Gateway startup recovery is still finishing. "
+                    "Your message was saved and will run next."
+                ),
+                durable_accepted=True,
+            )
+        if state == "handled":
+            return _StartupGateDecision("", True)
+        if state == "completed":
+            return _StartupGateDecision(self._DRAIN_COMPLETED_NOTICE, True)
+        if state == "claimed":
+            return _StartupGateDecision(self._DRAIN_UNCERTAIN_NOTICE, True)
+        if state == "ambiguous":
+            return _StartupGateDecision("", True)
+        return _StartupGateDecision(
+            response=(
+                "⚠️ Gateway startup recovery is still finishing and could not "
+                "safely claim this message. Please resend it after startup completes."
+            ),
+            durable_accepted=False,
+        )
+
+    async def _persist_startup_gate_handled_event_locked(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        reason: str = "startup-restore-plugin-handled",
+    ) -> _StartupGateDecision:
+        if not getattr(event, "_hermes_pre_gateway_dispatch_claimed", False):
+            return _StartupGateDecision(
+                response=(
+                    "⚠️ Hermes handled this message during startup but could not "
+                    "durably confirm completion. It will not retry automatically."
+                ),
+                durable_accepted=False,
+            )
+        _queue_id, state = await self._finalize_pre_dispatch_drain_event_result(
+            event,
+            session_key,
+            handled=True,
+            reason=reason,
+        )
+        if state in {"handled", "completed"}:
+            return _StartupGateDecision("", True)
+        if state == "claimed":
+            if reason == "startup-restore-unauthorized-rejected":
+                return _StartupGateDecision("", False)
+            return _StartupGateDecision(self._DRAIN_UNCERTAIN_NOTICE, True)
+        if state == "ambiguous":
+            return _StartupGateDecision("", True)
+        return _StartupGateDecision(
+            response=(
+                "⚠️ Hermes handled this message during startup but could not "
+                "durably confirm completion. It will not retry automatically."
+            ),
+            durable_accepted=False,
+        )
+
+    async def _record_startup_pre_dispatch_attempt_locked(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[_StartupGateDecision]:
+        queue_id, state = await self._record_pre_dispatch_drain_attempt_result(
+            event,
+            session_key,
+        )
+        if state == "claimed":
+            return None
+        if state == "ambiguous":
+            return _StartupGateDecision(
+                "",
+                True,
+                drain_pending=True,
+                queue_id=queue_id,
+                receipt_state=state,
+            )
+        return _StartupGateDecision(
+            response=(
+                "⚠️ Gateway startup recovery is still finishing and could not "
+                "durably record this message's pre-dispatch result. Please resend "
+                "it after startup completes."
+            ),
+            durable_accepted=False,
+        )
+
+    async def _persist_startup_gate_control_event_locked(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> _StartupGateDecision:
+        _queue_id, state = await self._finalize_pre_dispatch_drain_event_result(
+            event,
+            session_key,
+            handled=True,
+            reason="startup-restore-control-rejected",
+        )
+        if state in {"handled", "completed"}:
+            return _StartupGateDecision(
+                response=(
+                    "⚠️ Gateway startup recovery is still finishing and control "
+                    "commands cannot be queued. Please resend this command after "
+                    "startup completes."
+                ),
+                durable_accepted=True,
+            )
+        if state == "claimed":
+            return _StartupGateDecision(self._DRAIN_UNCERTAIN_NOTICE, True)
+        if state == "ambiguous":
+            return _StartupGateDecision("", True)
+        return _StartupGateDecision(
+            response=(
+                "⚠️ Gateway startup recovery is still finishing and could not "
+                "safely reject this control command. Please resend it after "
+                "startup completes."
+            ),
+            durable_accepted=False,
+        )
+
+    async def _persist_startup_gate_event_locked(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> _StartupGateDecision:
+        if getattr(event, "_hermes_pre_gateway_dispatch_claimed", False):
+            queue_id, state = (
+                await self._finalize_pre_dispatch_drain_event_result(
+                    event,
+                    session_key,
+                    handled=False,
+                    reason="startup-restore-gate",
+                )
+            )
+        else:
+            existing = await self._existing_startup_gate_decision(
+                event,
+                session_key,
+            )
+            if existing is not None:
+                return existing
+            queue_id, state = await self._persist_drain_event_result(
+                event,
+                session_key,
+                reason="startup-restore-gate",
+            )
+        local_outcome = getattr(self, "_drain_replay_outcomes", {}).get(
+            str(queue_id or "")
+        )
+        if local_outcome == "running":
+            return _StartupGateDecision(
+                response=(
+                    "⏳ Hermes is already processing this saved instruction. "
+                    "It will not start it again."
+                ),
+                durable_accepted=True,
+            )
+        if local_outcome == "completed":
+            return _StartupGateDecision(self._DRAIN_COMPLETED_NOTICE, True)
+        if state == "queued":
+            return _StartupGateDecision(
+                response=(
+                    "⏳ Gateway startup recovery is still finishing. "
+                    "Your message was saved and will run next."
+                ),
+                durable_accepted=True,
+            )
+        if state == "claimed":
+            return _StartupGateDecision(self._DRAIN_UNCERTAIN_NOTICE, True)
+        if state == "ambiguous":
+            return _StartupGateDecision(
+                "",
+                True,
+                drain_pending=True,
+                queue_id=queue_id,
+                receipt_state=state,
+            )
+        if state == "completed":
+            return _StartupGateDecision(self._DRAIN_COMPLETED_NOTICE, True)
+        if state == "handled":
+            return _StartupGateDecision("", True)
+        return _StartupGateDecision(
+            response=(
+                "⚠️ Gateway startup recovery is still finishing and could not "
+                "safely save this message. Please resend it after startup completes."
+            ),
+            durable_accepted=False,
+        )
+
+    def _make_startup_gate_handler(self, message_handler):
+        async def _handler(
+            event: MessageEvent,
+            session_key: str,
+            session_was_busy: bool,
+        ) -> bool:
+            return await self._handle_startup_gate_message(
+                event,
+                session_key,
+                message_handler,
+                session_was_busy,
+            )
+
+        return _handler
+
+    async def _handle_startup_gate_message(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        message_handler,
+        session_was_busy: bool,
+    ) -> bool:
+        decision = None
+        if (
+            _event_bypasses_startup_gate(event)
+            or getattr(event, "_hermes_startup_restore_replay", False)
+        ):
+            return False
+        if not getattr(self, "_startup_restore_in_progress", False):
+            decision = await self._existing_startup_gate_decision(
+                event,
+                session_key,
+            )
+            if decision is None:
+                return False
+        else:
+            if (
+                session_was_busy
+                and not getattr(event, "internal", False)
+                and not self._is_user_authorized(event.source)
+            ):
+                return True
+            async with self._get_startup_restore_barrier():
+                if (
+                    not getattr(self, "_startup_restore_in_progress", False)
+                    or _event_bypasses_startup_gate(event)
+                    or getattr(event, "_hermes_startup_restore_replay", False)
+                ):
+                    return False
+                decision = await self._existing_startup_gate_decision(
+                    event,
+                    session_key,
+                )
+                if decision is None:
+                    if session_was_busy:
+                        decision = await self._persist_startup_gate_event_locked(
+                            event,
+                            session_key,
+                        )
+                    else:
+                        setattr(event, "_hermes_startup_gate_barrier_held", True)
+                        try:
+                            handler_result = await message_handler(event)
+                        finally:
+                            try:
+                                delattr(event, "_hermes_startup_gate_barrier_held")
+                            except AttributeError:
+                                pass
+                        decision = (
+                            handler_result
+                            if isinstance(handler_result, _StartupGateDecision)
+                            else (
+                                _StartupGateDecision(str(handler_result), False)
+                                if handler_result
+                                else None
+                            )
+                        )
+        if (
+            decision is not None
+            and not decision.durable_accepted
+            and event.retry_transport_on_admission_failure
+        ):
+            raise RuntimeError("startup-gate admission requires transport retry")
+        post_startup_cleanup = bool(
+            decision is not None
+            and decision.drain_pending
+            and not getattr(self, "_startup_restore_in_progress", False)
+        )
+        if (
+            post_startup_cleanup
+            and decision is not None
+            and decision.receipt_state == "queued"
+        ):
+            self._schedule_post_startup_drain()
+        if decision is not None and decision.response:
+            adapter = self._adapter_for_source(event.source)
+            if adapter is None:
+                if decision.durable_accepted:
+                    logger.warning(
+                        "Durably accepted startup-gate message without a response adapter"
+                    )
+                    return True
+                raise RuntimeError("startup-gate response adapter is unavailable")
+            reply_anchor = self._reply_anchor_for_event(event)
+            result = await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=decision.response,
+                reply_to=reply_anchor,
+                metadata=self._thread_metadata_for_source(
+                    event.source,
+                    reply_anchor,
+                ),
+            )
+            if not getattr(result, "success", False):
+                if decision.durable_accepted:
+                    logger.warning(
+                        "Startup-gate notice delivery failed after durable acceptance"
+                    )
+                    return True
+                raise RuntimeError("startup-gate response delivery was not accepted")
+        if post_startup_cleanup and decision is not None:
+            if (
+                decision.receipt_state in {"claimed", "ambiguous"}
+                and decision.queue_id
+            ):
+                if await self._persist_ambiguous_drain_marker(
+                    event,
+                    session_key,
+                    decision.queue_id,
+                ):
+                    acknowledged = await asyncio.to_thread(
+                        acknowledge_drain_event,
+                        decision.queue_id,
+                        getattr(self, "_drain_inbox_path", None),
+                        expected_state=decision.receipt_state,
+                        producer_token=getattr(
+                            self,
+                            "_drain_inbox_producer_token",
+                            None,
+                        ),
+                    )
+                    if not acknowledged:
+                        self._schedule_post_startup_drain()
+                else:
+                    self._schedule_post_startup_drain()
+            elif decision.receipt_state != "queued":
+                self._schedule_post_startup_drain()
+        return True
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
 
@@ -8585,17 +9290,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True  # handled (silently dropped); do not fall through
 
+        if getattr(event, "_hermes_startup_restore_replay", False):
+            return True
+
         # --- Draining case (gateway restarting/stopping) ---
-        if self._draining:
+        if self._draining or self._external_drain_active:
             adapter = self._adapter_for_source(event.source)
             if not adapter:
                 return True
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled():
+            if await self._persist_drain_event(
+                event,
+                session_key,
+                reason="active-session-drain",
+            ):
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                message = (
+                    f"⏳ Gateway is {self._status_action_gerund()}. "
+                    "I saved this message and will run it when I come back."
+                )
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
@@ -9092,9 +9807,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         action = "restarting" if self._restart_requested else "shutting down"
         hint = (
             "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
+            "I'll check in when the gateway is back."
             if self._restart_requested
-            else "Your current task will be interrupted."
+            else (
+                "Your current task will be interrupted. "
+                "I'll check in the next time the gateway starts."
+            )
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
@@ -9943,6 +10661,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _AUTO_RESUME_REASONS = frozenset(
         {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
     )
+    _DRAIN_UNCERTAIN_NOTICE = (
+        "⚠️ Hermes could not confirm completion of your saved instruction. "
+        "It did not retry it. Please resend the instruction if you want it run again."
+    )
+    _DRAIN_COMPLETED_NOTICE = (
+        "✅ Hermes already completed this saved instruction. "
+        "It will not run it again."
+    )
 
     async def _run_startup_resume_event(
         self,
@@ -9960,11 +10686,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         returns.
         """
         try:
-            await adapter.handle_message(event)
-            session_tasks = getattr(adapter, "_session_tasks", {})
-            task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
-            if task is not None:
-                await asyncio.shield(task)
+            task = await adapter.handle_message(event)
+            if task is None:
+                raise RuntimeError("startup replay did not start a handler task")
+            await asyncio.shield(task)
+            if (
+                getattr(event, "_hermes_startup_restore_replay", False)
+                and not getattr(event, "_hermes_handler_succeeded", False)
+            ):
+                raise RuntimeError("startup replay handler failed")
         finally:
             # _schedule_resume_pending_sessions pre-claims the runner slot
             # before spawning this task.  If adapter.handle_message raises
@@ -9974,61 +10704,442 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
                 self._release_running_agent_state(session_key)
 
-    def _queue_startup_restore_event(self, event: MessageEvent) -> None:
-        queue = getattr(self, "_startup_restore_queue", None)
-        if queue is None:
-            queue = []
-            self._startup_restore_queue = queue
-        queue.append(event)
+    async def _deliver_uncertain_drain_notice(
+        self,
+        adapter: BasePlatformAdapter,
+        source: SessionSource,
+    ) -> bool:
         try:
-            source = event.source
-            logger.info(
-                "Queued inbound message during gateway startup restore: platform=%s chat=%s",
-                source.platform.value if source and source.platform else "unknown",
-                source.chat_id if source else "unknown",
+            result = await adapter._send_with_retry(
+                chat_id=source.chat_id,
+                content=self._DRAIN_UNCERTAIN_NOTICE,
+                metadata=self._thread_metadata_for_source(source),
             )
         except Exception:
-            pass
+            logger.exception("Failed to deliver uncertain drain-inbox notice")
+            return False
+        return bool(getattr(result, "success", False))
 
-    async def _drain_startup_restore_queue(self) -> int:
-        """Replay inbound messages queued while startup auto-resume ran."""
-        drained = 0
-        queue = getattr(self, "_startup_restore_queue", None)
-        if queue is None:
-            return 0
-        while queue:
-            event = queue.pop(0)
-            source = getattr(event, "source", None)
-            adapter = self._adapter_for_source(source)
-            if adapter is None:
-                logger.debug(
-                    "Dropping startup-restore queued message: adapter unavailable for %s",
-                    getattr(getattr(source, "platform", None), "value", None),
+    async def _persist_ambiguous_drain_marker(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        queue_id: str,
+    ) -> bool:
+        try:
+            entry = await self.async_session_store.get_or_create_session(
+                event.source
+            )
+            message_id = str(event.message_id or f"drain:{queue_id}")
+            if not await self.async_session_store.persist_replay_marker(
+                entry.session_id,
+                message_id,
+                timestamp=time.time(),
+            ):
+                return False
+            if hasattr(self, "_session_db"):
+                await self._refresh_agent_cache_message_count(
+                    session_key,
+                    entry.session_id,
                 )
-                continue
-            # Mark this replay so _handle_message does not queue it again while
-            # the restore gate remains closed for any fresh inbound arrivals.
+            return True
+        except Exception:
+            logger.exception(
+                "Failed to persist ambiguous drain-inbox replay marker for %s",
+                queue_id or "?",
+            )
+            return False
+
+    def _schedule_post_startup_drain(self) -> None:
+        current = getattr(self, "_post_startup_drain_task", None)
+        if current is not None and not current.done():
+            return
+
+        async def _run() -> None:
             try:
-                setattr(event, "_hermes_startup_restore_replay", True)
+                await self._drain_persisted_drain_inbox()
+            except asyncio.CancelledError:
+                raise
             except Exception:
+                logger.exception("Post-startup durable inbox drain failed")
+            finally:
+                if (
+                    getattr(self, "_post_startup_drain_task", None)
+                    is asyncio.current_task()
+                ):
+                    self._post_startup_drain_task = None
+
+        task = asyncio.create_task(_run(), name="gateway-post-startup-drain")
+        self._post_startup_drain_task = task
+        background_tasks = getattr(self, "_background_tasks", None)
+        if not isinstance(background_tasks, set):
+            background_tasks = set()
+            self._background_tasks = background_tasks
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+    async def _drain_persisted_drain_inbox(
+        self,
+        attempted_queue_ids: Optional[set[str]] = None,
+    ) -> int:
+        """Replay work durably accepted by the previous gateway process."""
+        inbox = getattr(self, "_drain_inbox_path", None)
+        producer_token = getattr(self, "_drain_inbox_producer_token", None)
+        cancellation_event = threading.Event()
+        acquire = (
+            asyncio.to_thread(
+                acquire_drain_producer_replay_lease,
+                producer_token,
+                inbox,
+                cancellation_event=cancellation_event,
+            )
+            if producer_token
+            else asyncio.to_thread(
+                acquire_drain_replay_lease,
+                inbox,
+                cancellation_event=cancellation_event,
+            )
+        )
+        acquisition_task = asyncio.create_task(acquire)
+        try:
+            replay_lease = await asyncio.shield(acquisition_task)
+        except asyncio.CancelledError:
+            cancellation_event.set()
+            try:
+                replay_lease = await asyncio.shield(acquisition_task)
+            except (InterruptedError, asyncio.CancelledError):
                 pass
-            await adapter.handle_message(event)
-            drained += 1
+            except Exception:
+                logger.debug(
+                    "Durable replay lease acquisition failed during cancellation",
+                    exc_info=True,
+                )
+            else:
+                cleanup = (
+                    cancel_drain_producer_replay_lease
+                    if producer_token
+                    else release_drain_replay_lease
+                )
+                await asyncio.shield(
+                    asyncio.to_thread(cleanup, replay_lease)
+                )
+            raise
+        try:
+            return await self._drain_persisted_drain_inbox_owned(
+                attempted_queue_ids
+            )
+        finally:
+            await asyncio.to_thread(
+                release_drain_replay_lease,
+                replay_lease,
+            )
+
+    async def _drain_persisted_drain_inbox_owned(
+        self,
+        attempted_queue_ids: Optional[set[str]] = None,
+    ) -> int:
+        drained = 0
+        inbox = getattr(self, "_drain_inbox_path", None)
+        producer_token = getattr(self, "_drain_inbox_producer_token", None)
+        attempted = attempted_queue_ids if attempted_queue_ids is not None else set()
+        while True:
+            records = await asyncio.to_thread(pending_drain_records, inbox)
+            records = [
+                record
+                for record in records
+                if str(record.get("queue_id") or "") not in attempted
+            ]
+            if not records:
+                break
+            for record in records:
+                queue_id = str(record.get("queue_id") or "")
+                attempted.add(queue_id)
+                try:
+                    event = drain_event_from_record(record)
+                    record_state = str(record.get("state") or "queued")
+                    source = event.source
+                    replay_scope = (
+                        _profile_runtime_scope(
+                            self._resolve_profile_home_for_source(source)
+                        )
+                        if getattr(self.config, "multiplex_profiles", False)
+                        else nullcontext()
+                    )
+                    with replay_scope:
+                        adapter = self._adapter_for_source(source)
+                        if adapter is None:
+                            logger.info(
+                                "Leaving drain-inbox row %s pending: adapter unavailable for %s",
+                                queue_id or "?",
+                                getattr(getattr(source, "platform", None), "value", None),
+                            )
+                            continue
+                        session_key = self._session_key_for_source(source)
+                        authorized = bool(
+                            getattr(event, "internal", False)
+                            or self._is_user_authorized(source)
+                        )
+                        if record_state not in {"queued", "completed", "handled"}:
+                            authorization_rejection = (
+                                record.get("recovery_disposition")
+                                == "unauthorized-rejected"
+                            )
+                            if authorization_rejection:
+                                _queue_id, record_state = (
+                                    await self._finalize_pre_dispatch_drain_event_result(
+                                        event,
+                                        session_key,
+                                        handled=True,
+                                        reason="startup-restore-unauthorized-rejected",
+                                    )
+                                )
+                                if record_state not in {"completed", "handled"}:
+                                    logger.warning(
+                                        "Authorization-rejection drain-inbox row %s "
+                                        "remains pending for silent cleanup",
+                                        queue_id or "?",
+                                    )
+                                    continue
+                            elif not authorized:
+                                logger.warning(
+                                    "Leaving uncertain drain-inbox row %s pending: "
+                                    "source is no longer authorized",
+                                    queue_id or "?",
+                                )
+                                continue
+                            elif not await self._deliver_uncertain_drain_notice(
+                                adapter,
+                                source,
+                            ):
+                                logger.warning(
+                                    "Uncertain drain-inbox row %s remains pending "
+                                    "because its warning was not accepted",
+                                    queue_id or "?",
+                                )
+                                continue
+                            else:
+                                if await self._persist_ambiguous_drain_marker(
+                                    event,
+                                    session_key,
+                                    queue_id,
+                                ):
+                                    if await asyncio.to_thread(
+                                        acknowledge_drain_event,
+                                        queue_id,
+                                        inbox,
+                                        producer_token=producer_token,
+                                    ):
+                                        drained += 1
+                                continue
+
+                        if (
+                            record_state == "queued"
+                            and not authorized
+                        ):
+                            logger.warning(
+                                "Leaving drain-inbox row %s pending: source is no longer authorized",
+                                queue_id or "?",
+                            )
+                            continue
+
+                        entry = await self.async_session_store.get_or_create_session(source)
+                        message_id = str(event.message_id or "")
+                        if (
+                            message_id
+                            and await self.async_session_store.replay_marker_status(
+                                entry.session_id,
+                                message_id,
+                            )
+                        ):
+                            if await asyncio.to_thread(
+                                acknowledge_drain_event,
+                                queue_id,
+                                inbox,
+                                producer_token=producer_token,
+                            ):
+                                drained += 1
+                                logger.info(
+                                    "Acknowledged already-committed drain-inbox row %s",
+                                    queue_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "Already-committed drain-inbox row %s could not be "
+                                    "acknowledged; it remains safe to retry",
+                                    queue_id or "?",
+                                )
+                            continue
+
+                        if record_state in {"completed", "handled"}:
+                            if not await self.async_session_store.persist_replay_marker(
+                                entry.session_id,
+                                message_id,
+                                timestamp=time.time(),
+                            ):
+                                logger.warning(
+                                    "Completed drain-inbox row %s still lacks its "
+                                    "canonical replay marker",
+                                    queue_id or "?",
+                                )
+                                continue
+                            if hasattr(self, "_session_db"):
+                                await self._refresh_agent_cache_message_count(
+                                    session_key,
+                                    entry.session_id,
+                                )
+                        else:
+                            replay_outcomes = getattr(
+                                self,
+                                "_drain_replay_outcomes",
+                                None,
+                            )
+                            if replay_outcomes is None:
+                                replay_outcomes = {}
+                                self._drain_replay_outcomes = replay_outcomes
+                            replay_outcomes[queue_id] = "running"
+                            if not await asyncio.to_thread(
+                                claim_drain_event,
+                                queue_id,
+                                inbox,
+                                producer_token=producer_token,
+                            ):
+                                replay_outcomes.pop(queue_id, None)
+                                logger.warning(
+                                    "Could not durably claim drain-inbox row %s; "
+                                    "leaving it pending",
+                                    queue_id or "?",
+                                )
+                                continue
+
+                            setattr(event, "_hermes_startup_restore_replay", True)
+                            try:
+                                await self._run_startup_resume_event(
+                                    adapter,
+                                    event,
+                                    session_key,
+                                )
+                            except asyncio.CancelledError:
+                                replay_outcomes.pop(queue_id, None)
+                                raise
+                            except Exception:
+                                replay_outcomes.pop(queue_id, None)
+                                logger.exception(
+                                    "Drain-inbox handler failed for row %s",
+                                    queue_id or "?",
+                                )
+                                if await self._deliver_uncertain_drain_notice(
+                                    adapter,
+                                    source,
+                                ):
+                                    if await self._persist_ambiguous_drain_marker(
+                                        event,
+                                        session_key,
+                                        queue_id,
+                                    ):
+                                        if await asyncio.to_thread(
+                                            acknowledge_drain_event,
+                                            queue_id,
+                                            inbox,
+                                            producer_token=producer_token,
+                                        ):
+                                            drained += 1
+                                continue
+
+                            if not await asyncio.to_thread(
+                                complete_drain_event,
+                                queue_id,
+                                inbox,
+                                producer_token=producer_token,
+                            ):
+                                replay_outcomes.pop(queue_id, None)
+                                logger.warning(
+                                    "Could not durably complete drain-inbox row %s",
+                                    queue_id or "?",
+                                )
+                                if await self._deliver_uncertain_drain_notice(
+                                    adapter,
+                                    source,
+                                ):
+                                    if await self._persist_ambiguous_drain_marker(
+                                        event,
+                                        session_key,
+                                        queue_id,
+                                    ):
+                                        if await asyncio.to_thread(
+                                            acknowledge_drain_event,
+                                            queue_id,
+                                            inbox,
+                                            producer_token=producer_token,
+                                        ):
+                                            drained += 1
+                                continue
+                            replay_outcomes[queue_id] = "completed"
+
+                            if not await self.async_session_store.persist_replay_marker(
+                                entry.session_id,
+                                message_id,
+                                timestamp=time.time(),
+                            ):
+                                logger.warning(
+                                    "Drain-inbox row %s completed but its replay marker "
+                                    "was not persisted; leaving it for cleanup",
+                                    queue_id or "?",
+                                )
+                                continue
+                            if hasattr(self, "_session_db"):
+                                await self._refresh_agent_cache_message_count(
+                                    session_key,
+                                    entry.session_id,
+                                )
+                except asyncio.CancelledError:
+                    replay_outcomes = getattr(
+                        self,
+                        "_drain_replay_outcomes",
+                        {},
+                    )
+                    if replay_outcomes.get(queue_id) == "running":
+                        replay_outcomes.pop(queue_id, None)
+                    raise
+                except Exception:
+                    replay_outcomes = getattr(
+                        self,
+                        "_drain_replay_outcomes",
+                        {},
+                    )
+                    if replay_outcomes.get(queue_id) == "running":
+                        replay_outcomes.pop(queue_id, None)
+                    logger.exception(
+                        "Drain-inbox replay failed for row %s; leaving it pending",
+                        queue_id or "?",
+                    )
+                    continue
+
+                if await asyncio.to_thread(
+                    acknowledge_drain_event,
+                    queue_id,
+                    inbox,
+                    producer_token=producer_token,
+                ):
+                    drained += 1
+                else:
+                    logger.warning(
+                        "Drain-inbox row %s ran but could not be acknowledged; "
+                        "platform message-id dedupe will guard the next boot",
+                        queue_id or "?",
+                    )
         return drained
 
     async def _finish_startup_restore(self) -> None:
-        """Wait (BOUNDED) for startup auto-resume, then release + drain inbound.
+        """Drain durable inbound, wait boundedly for recovery, then release.
 
         The wait is bounded by ``_startup_restore_drain_timeout_secs`` so that
-        a single pathologically long boot-resume turn cannot hold the inbound
-        gate shut for every channel.  On timeout we release the gate and let
-        the still-running resume turn(s) finish in the background — they are
-        NOT cancelled.  This is safe because duplicate-agent protection does
-        not depend on the wait: ``_schedule_resume_pending_sessions`` claims
-        each session's ``_running_agents`` slot SYNCHRONOUSLY before this gate
-        runs, so any inbound message drained while a resume turn is still in
-        flight queues behind that slot instead of spawning a second agent.
+        a slow recovery notice cannot hold the durable inbound gate forever.
+        Pending tasks continue in the background and the final barrier drain
+        captures messages admitted while recovery was in progress.
         """
+        attempted_queue_ids: set[str] = set()
+        persisted = await self._drain_persisted_drain_inbox(attempted_queue_ids)
+        self._schedule_resume_pending_sessions()
         tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
         if tasks:
             timeout = _startup_restore_drain_timeout_secs()
@@ -10069,10 +11180,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=(type(exc), exc, exc.__traceback__),
                     )
         self._startup_restore_tasks = []
-        drained = await self._drain_startup_restore_queue()
-        self._startup_restore_in_progress = False
-        if drained:
-            logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+        async with self._get_startup_restore_barrier():
+            persisted += await self._drain_persisted_drain_inbox(
+                attempted_queue_ids
+            )
+            self._startup_restore_in_progress = False
+            getattr(self, "_drain_replay_outcomes", {}).clear()
+        if persisted:
+            logger.info(
+                "Drained %d message(s) from the durable shutdown inbox",
+                persisted,
+            )
 
     @staticmethod
     def _log_background_resume_result(task: "asyncio.Task") -> None:
@@ -10781,10 +11899,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Serialize startup restore against inbound dispatch.  Platform
         # adapters can begin receiving messages as soon as they connect, but
         # restart-interrupted sessions are not auto-resumed until all startup
-        # wiring below completes.  Queue inbound messages until the resume
+        # wiring below completes.  Durably hold inbound messages until the resume
         # pass runs and every synthetic resume turn has finished.
         self._startup_restore_in_progress = True
-        self._startup_restore_queue = []
         self._startup_restore_tasks = []
 
         connected_count = 0
@@ -10837,7 +11954,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # default profile needs the same whole-handler runtime scope as a
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
-            adapter.set_message_handler(self._primary_message_handler())
+            message_handler = cast(MessageHandler, self._primary_message_handler())
+            adapter.set_message_handler(message_handler)
+            adapter.set_startup_gate_handler(
+                self._make_startup_gate_handler(message_handler)
+            )
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -11181,18 +12302,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             finally:
                 _clear_planned_restart_notification()
 
-        # Automatically continue fresh sessions that were interrupted by the
-        # previous gateway restart/shutdown.  The resume_pending flag is cleared
-        # by the normal successful-turn path, so a failed auto-resume remains
-        # visible for manual recovery on the next user message.
-        #
-        # Delivery-obligation redelivery runs FIRST: a session whose final
-        # response was generated but never confirmed-delivered has its answer
-        # in the ledger — redelivering it (and clearing resume_pending for
-        # that session) is strictly cheaper and more correct than re-running
-        # the whole turn.
+        # Redeliver an already-produced final response before startup recovery
+        # schedules any interrupted-session check-in or durable inbox replay.
         await self._redeliver_pending_obligations()
-        self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
@@ -11642,7 +12754,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # adapter.handle_message would spawn a background task and we'd
         # lose synchronous error visibility; calling _handle_message inline
         # keeps the success/failure path observable for the watcher.
-        response_text = await self._handle_message(synthetic_event)
+        response_text = cast(Optional[str], await self._handle_message(synthetic_event))
         if not response_text:
             # Streaming may have already delivered the response inline.
             # Either way, agent ran without raising — count as success.
@@ -12209,7 +13321,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
-                    adapter.set_message_handler(self._primary_message_handler())
+                    message_handler = cast(MessageHandler, self._primary_message_handler())
+                    adapter.set_message_handler(message_handler)
+                    adapter.set_startup_gate_handler(
+                        self._make_startup_gate_handler(message_handler)
+                    )
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -13149,7 +14265,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
-        adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+        message_handler = self._make_profile_message_handler(profile_name)
+        adapter.set_message_handler(message_handler)
+        adapter.set_startup_gate_handler(
+            self._make_startup_gate_handler(message_handler)
+        )
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
@@ -14069,7 +15189,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_goal_command(event)
         return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
-    async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_message(
+        self,
+        event: MessageEvent,
+    ) -> Optional[Union[str, _StartupGateDecision]]:
         """
         Handle an incoming message from any platform.
         
@@ -14083,6 +15206,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        startup_restore_replay = bool(
+            getattr(event, "_hermes_startup_restore_replay", False)
+        )
+        pre_gateway_dispatch_attempted = (
+            getattr(
+                event,
+                "_hermes_pre_gateway_dispatch_attempted",
+                False,
+            )
+            is True
+        )
+        startup_gate_barrier_held = bool(
+            getattr(event, "_hermes_startup_gate_barrier_held", False)
+        )
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -14123,15 +15260,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(source, "chat_id", None),
             )
             return None
-
-        if (
-            getattr(self, "_startup_restore_in_progress", False)
-            and not is_internal
-            and not getattr(event, "_hermes_startup_restore_replay", False)
-        ):
-            self._queue_startup_restore_event(event)
-            return None
-
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
         # (background-process completions, startup-restore replays) are NOT
@@ -14147,7 +15275,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
-        if not is_internal:
+        if not is_internal and not (
+            startup_restore_replay and pre_gateway_dispatch_attempted
+        ):
+            if startup_gate_barrier_held:
+                claim_decision = (
+                    await self._claim_startup_pre_dispatch_event_locked(
+                        event,
+                        self._session_key_for_source(source),
+                    )
+                )
+                if claim_decision is not None:
+                    return claim_decision
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
                 _hook_results = _invoke_hook(
@@ -14162,6 +15301,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _hook_exc:
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
                 _hook_results = []
+            setattr(
+                event,
+                "_hermes_pre_gateway_dispatch_attempted",
+                True,
+            )
 
             for _result in _hook_results:
                 if not isinstance(_result, dict):
@@ -14174,15 +15318,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source.platform.value if source.platform else "unknown",
                         source.chat_id or "unknown",
                     )
+                    if startup_gate_barrier_held:
+                        phase_decision = (
+                            await self._record_startup_pre_dispatch_attempt_locked(
+                                event,
+                                self._session_key_for_source(source),
+                            )
+                        )
+                        if phase_decision is not None:
+                            return phase_decision
+                        return await self._persist_startup_gate_handled_event_locked(
+                            event,
+                            self._session_key_for_source(source),
+                        )
                     return None
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
+                        event = event.replaced(text=_new_text)
+                        if startup_restore_replay:
+                            setattr(event, "_hermes_startup_restore_replay", True)
+                        if startup_gate_barrier_held:
+                            setattr(
+                                event,
+                                "_hermes_startup_gate_barrier_held",
+                                True,
+                            )
+                            setattr(
+                                event,
+                                "_hermes_pre_gateway_dispatch_claimed",
+                                True,
+                            )
+                        setattr(
+                            event,
+                            "_hermes_pre_gateway_dispatch_attempted",
+                            True,
+                        )
                         source = event.source
                     break
                 if _action == "allow":
                     break
+
+            if startup_gate_barrier_held:
+                phase_decision = (
+                    await self._record_startup_pre_dispatch_attempt_locked(
+                        event,
+                        self._session_key_for_source(source),
+                    )
+                )
+                if phase_decision is not None:
+                    return phase_decision
 
         if is_internal:
             pass
@@ -14195,9 +15380,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                if getattr(
+                    event,
+                    "_hermes_pre_gateway_dispatch_claimed",
+                    False,
+                ):
+                    decision = await self._persist_startup_gate_handled_event_locked(
+                        event,
+                        self._session_key_for_source(source),
+                        reason="startup-restore-unauthorized-rejected",
+                    )
+                    return _StartupGateDecision(
+                        "",
+                        decision.durable_accepted,
+                    )
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            rejection_decision = None
+            if getattr(
+                event,
+                "_hermes_pre_gateway_dispatch_claimed",
+                False,
+            ):
+                rejection_decision = (
+                    await self._persist_startup_gate_handled_event_locked(
+                        event,
+                        self._session_key_for_source(source),
+                        reason="startup-restore-unauthorized-rejected",
+                    )
+                )
+                rejection_decision = _StartupGateDecision(
+                    "",
+                    rejection_decision.durable_accepted,
+                )
+                if not rejection_decision.durable_accepted:
+                    return rejection_decision
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
                 source.chat_type == "dm"
@@ -14219,7 +15437,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
                 if pairing_store._is_rate_limited(platform_name, source.user_id):
-                    return None
+                    return rejection_decision
                 code = pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
                 )
@@ -14252,7 +15470,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
-            return None
+            return rejection_decision
+
+
+        if (
+            getattr(event, "_hermes_pre_gateway_dispatch_claimed", False)
+            and str(event.text or "").lstrip().startswith("/")
+        ):
+            return await self._persist_startup_gate_control_event_locked(
+                event,
+                self._session_key_for_source(source),
+            )
+
+        startup_decision = await self._persist_startup_gate_event_decision(
+            event,
+            self._session_key_for_source(source),
+        )
+        if startup_decision is not None:
+            return startup_decision
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -14592,14 +15827,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         merge_text=True,
                     )
                 return None
-            if self._draining:
-                if self._queue_during_drain_enabled():
+            if self._draining or self._external_drain_active:
+                if await self._persist_drain_event(
+                    event,
+                    _quick_key,
+                    reason="running-session-drain",
+                ):
                     self._queue_or_replace_pending_event(_quick_key, event)
-                return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-                )
+                    return (
+                        f"⏳ Gateway is {self._status_action_gerund()}. "
+                        "I saved this message and will run it when I come back."
+                    )
+                return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
             if self._busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -15138,7 +16377,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
-        if self._draining:
+        if self._draining or self._external_drain_active:
+            if await self._persist_drain_event(
+                event,
+                _quick_key,
+                reason="new-session-drain",
+            ):
+                return (
+                    f"⏳ Gateway is {self._status_action_gerund()}. "
+                    "I saved this message and will run it when I come back."
+                )
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
         # User-defined quick commands (bypass agent loop, no LLM call)
@@ -15379,27 +16627,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._should_send_telegram_lobby_reminder(source):
                 return self._telegram_topic_root_lobby_message()
             return None
-
-        # ── External-drain new-turn gate (Phase 2) ────────────────────
-        # When NAS has engaged an external drain (.drain_request.json present,
-        # observed by _drain_control_watcher), refuse to START a new turn so
-        # the in-flight set can only fall to zero — eliminating the TOCTOU race
-        # (D4a: stop accepting new turns FIRST, then NAS polls until
-        # active_agents==0). In-flight turns are untouched; this only blocks the
-        # claim of a NEW session slot. Internal/system events (restart-recovery
-        # replays, background-process completions) bypass the gate — they are
-        # not user-initiated new work and must still flow during a drain.
-        # Reversible: once the marker is removed the gate opens again.
-        if self._external_drain_active and not is_internal:
-            logger.info(
-                "Refusing new turn for session %s — external drain active.",
-                _quick_key,
-            )
-            return (
-                "⏳ This agent is draining for a maintenance action and isn't "
-                "accepting new turns right now. It'll be back in a moment — "
-                "please resend shortly."
-            )
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
@@ -25120,16 +26347,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-            if self._draining and (pending_event or pending):
-                logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
-                    session_key or "?",
-                    self._status_action_label(),
-                )
-                pending_event = None
-                pending = None
+            pending_event, pending = await self._persist_pending_followup_for_drain(
+                pending_event,
+                pending,
+                source,
+                session_key,
+            )
 
             if pending_event or pending:
+                # Both values are established only after a completed agent
+                # result; the branch already relies on pending text below.
+                result = cast(Dict[str, Any], result)
+                pending = cast(str, pending)
                 logger.debug("Processing pending message: '%s...'", pending[:40])
 
                 # Clear the adapter's interrupt event so the next _run_agent call

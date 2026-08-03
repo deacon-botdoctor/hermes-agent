@@ -2113,6 +2113,7 @@ class MessageEvent:
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
+    durable_ingress: bool = False
 
     # Free-form per-event metadata.  Adapters may set platform-specific
     # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
@@ -2123,6 +2124,14 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+    retry_transport_on_admission_failure: bool = False
+
+    def replaced(self, **changes: Any) -> "MessageEvent":
+        replacement = dataclasses.replace(self, **changes)
+        for name, value in vars(self).items():
+            if name.startswith("_hermes_"):
+                setattr(replacement, name, value)
+        return replacement
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -2721,17 +2730,8 @@ class BasePlatformAdapter(ABC):
     # generic seam; Slack is merely the first consumer).
     supports_inchannel_continuable: bool = False
 
-    # Whether a human is interactively present on this platform to answer a
-    # "session restored — what next?" prompt.  The startup auto-resume turn
-    # (``_schedule_resume_pending_sessions`` → the ``_is_resume_pending``
-    # branch in ``_handle_message_with_agent``) reads this to pick its
-    # guidance: interactive platforms (Telegram, Slack, Discord DMs, …) get
-    # "report the restore and ask what the user wants next"; non-interactive
-    # event platforms (webhook) get "finish the interrupted work" because
-    # nobody is there to answer, and an acknowledgement would silently
-    # abandon the task (#57056).  Read generically via ``getattr(adapter,
-    # "interactive_resume", True)`` — no per-platform branching at the call
-    # site.
+    # Whether a human is interactively present on this platform for restart
+    # recovery messaging.
     interactive_resume: bool = True
 
     # Back-reference to the running ``GatewayRunner``, injected by
@@ -2807,6 +2807,9 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        self._startup_gate_handler: Optional[
+            Callable[[MessageEvent, str, bool], Awaitable[bool]]
+        ] = None
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -3345,6 +3348,12 @@ class BasePlatformAdapter(ABC):
         # Assign defensively: subclasses initialized via ``object.__new__``
         # in tests never run ``BasePlatformAdapter.__init__``.
         self._reaction_handler = handler  # type: ignore[attr-defined]
+
+    def set_startup_gate_handler(
+        self,
+        handler: Optional[Callable[[MessageEvent, str, bool], Awaitable[bool]]],
+    ) -> None:
+        self._startup_gate_handler = handler
 
     def set_authorization_check(
         self,
@@ -5360,12 +5369,12 @@ class BasePlatformAdapter(ABC):
         session_key: str,
         *,
         interrupt_event: Optional[asyncio.Event] = None,
-    ) -> bool:
+    ) -> Optional[asyncio.Task]:
         """Spawn a background processing task under the given session guard.
 
-        Returns True on success.  If the runtime stubs ``create_task`` with a
+        Returns the owner task on success. If the runtime stubs ``create_task`` with a
         non-Task sentinel (some tests do this), the guard is rolled back and
-        False is returned so the caller isn't left holding a half-installed
+        None is returned so the caller isn't left holding a half-installed
         session lock.
         """
         guard = interrupt_event or asyncio.Event()
@@ -5380,11 +5389,11 @@ class BasePlatformAdapter(ABC):
             # hashable and do not support lifecycle callbacks.
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
-            return False
+            return None
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
-        return True
+        return task
 
     async def cancel_session_processing(
         self,
@@ -5532,7 +5541,31 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def _preflight_startup_gate(self, event: MessageEvent) -> bool:
+        coerce_plaintext_gateway_command(event)
+        await asyncio.to_thread(self._apply_topic_recovery, event)
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user",
+                True,
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user",
+                False,
+            ),
+        )
+        startup_gate_handler = getattr(self, "_startup_gate_handler", None)
+        if startup_gate_handler is not None and await startup_gate_handler(
+            event,
+            session_key,
+            session_key in self._active_sessions,
+        ):
+            return True
+        setattr(event, "_hermes_startup_gate_checked", True)
+        return False
+
+    async def handle_message(self, event: MessageEvent) -> Optional[asyncio.Task]:
         """
         Process an incoming message.
         
@@ -5555,6 +5588,10 @@ class BasePlatformAdapter(ABC):
         )
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
+
+        if not getattr(event, "_hermes_startup_gate_checked", False):
+            if await self._preflight_startup_gate(event):
+                return
 
         session_key = build_session_key(
             event.source,
@@ -5735,7 +5772,7 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
-        self._start_session_processing(event, session_key)
+        return self._start_session_processing(event, session_key)
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -5811,12 +5848,17 @@ class BasePlatformAdapter(ABC):
                 typing_task,
                 metadata=_thread_metadata,
             )
-        
+
+        if getattr(event, "_hermes_startup_restore_replay", False):
+            setattr(event, "_hermes_handler_succeeded", False)
+
         try:
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            if getattr(event, "_hermes_startup_restore_replay", False):
+                setattr(event, "_hermes_handler_succeeded", True)
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to

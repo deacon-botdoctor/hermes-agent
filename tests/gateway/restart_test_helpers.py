@@ -64,6 +64,7 @@ def make_restart_runner(
     runner._pending_approvals = {}
     runner._pending_model_notes = {}
     runner._background_tasks = set()
+    runner._drain_replay_outcomes = {}
     runner._draining = False
     runner._restart_requested = False
     runner._signal_initiated_shutdown = False
@@ -109,9 +110,6 @@ def make_restart_runner(
     runner._status_action_gerund = GatewayRunner._status_action_gerund.__get__(
         runner, GatewayRunner
     )
-    runner._queue_during_drain_enabled = GatewayRunner._queue_during_drain_enabled.__get__(
-        runner, GatewayRunner
-    )
     runner._running_agent_count = GatewayRunner._running_agent_count.__get__(
         runner, GatewayRunner
     )
@@ -149,10 +147,14 @@ def make_restart_runner(
     runner.pairing_store = MagicMock()
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
+    runner.session_store.replay_marker_status_for_session_key.return_value = False
     runner.delivery_router = MagicMock()
 
     platform_adapter = adapter or RestartTestAdapter()
     platform_adapter.set_message_handler(AsyncMock(return_value=None))
+    platform_adapter.set_startup_gate_handler(
+        runner._make_startup_gate_handler(runner._handle_message)
+    )
     platform_adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
     runner.adapters = {Platform.TELEGRAM: platform_adapter}
     return runner, platform_adapter

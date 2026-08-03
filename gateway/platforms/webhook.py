@@ -100,6 +100,7 @@ def _is_webhook_silence_response(content: Any) -> bool:
 # names a profile this gateway does not serve (→ 404). Distinct from None
 # (no prefix / multiplexing off → handle as the default profile).
 _PROFILE_REJECTED = object()
+_DELIVERY_METADATA_KEY = "webhook_delivery"
 
 _BUILTIN_DELIVER_PLATFORMS = {
     "telegram", "discord", "slack", "signal", "sms", "whatsapp",
@@ -349,6 +350,26 @@ class WebhookAdapter(BasePlatformAdapter):
             self._runner = None
         self._mark_disconnected()
         logger.info("[webhook] Disconnected")
+
+    async def handle_message(self, event: MessageEvent) -> Optional[asyncio.Task]:
+        delivery = event.metadata.get(_DELIVERY_METADATA_KEY)
+        if delivery is not None:
+            if not isinstance(delivery, dict):
+                raise ValueError("webhook delivery metadata must be an object")
+            deliver_type = delivery.get("deliver")
+            deliver_extra = delivery.get("deliver_extra")
+            if not isinstance(deliver_type, str) or not isinstance(deliver_extra, dict):
+                raise ValueError("webhook delivery metadata is invalid")
+            chat_id = str(event.source.chat_id or "")
+            if chat_id and chat_id not in self._delivery_info:
+                now = time.time()
+                self._delivery_info[chat_id] = {
+                    "deliver": deliver_type,
+                    "deliver_extra": deliver_extra,
+                }
+                self._delivery_info_created[chat_id] = now
+                self._delivery_info_order.append((now, chat_id))
+        return await super().handle_message(event)
 
     async def send(
         self,
@@ -791,25 +812,24 @@ class WebhookAdapter(BasePlatformAdapter):
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
         # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+        delivery_id = next(
+            (
+                str(request.headers.get(header) or "").strip()
+                for header in ("X-GitHub-Delivery", "svix-id", "X-Request-ID")
+                if str(request.headers.get(header) or "").strip()
             ),
+            "",
         )
+        if not delivery_id:
+            identity_scope = (
+                f"{profile or ''}\0{route_name}\0{event_type}\0".encode("utf-8")
+            )
+            delivery_id = (
+                "sha256:"
+                + hashlib.sha256(identity_scope + raw_body).hexdigest()
+            )
 
-        # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
         now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
-            logger.info(
-                "[webhook] Skipping duplicate delivery %s", delivery_id
-            )
-            return web.json_response(
-                {"status": "duplicate", "delivery_id": delivery_id},
-                status=200,
-            )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
@@ -818,6 +838,12 @@ class WebhookAdapter(BasePlatformAdapter):
         # to a user's chat with zero LLM cost.  Reuses the same HMAC auth,
         # rate limiting, idempotency, and template rendering as agent mode.
         if route_config.get("deliver_only"):
+            if not self._record_delivery_id(delivery_id, now):
+                logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
+                return web.json_response(
+                    {"status": "duplicate", "delivery_id": delivery_id},
+                    status=200,
+                )
             delivery = {
                 "deliver": route_config.get("deliver", "log"),
                 "deliver_extra": self._render_delivery_extra(
@@ -903,6 +929,10 @@ class WebhookAdapter(BasePlatformAdapter):
             source=source,
             raw_message=payload,
             message_id=delivery_id,
+            retry_transport_on_admission_failure=(
+                deliver_config["deliver"] == "log"
+            ),
+            metadata={_DELIVERY_METADATA_KEY: deliver_config},
         )
 
         logger.info(
@@ -914,11 +944,40 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
         )
 
-        # Non-blocking — return 202 Accepted immediately.  The per-delivery
-        # session is closed by the ``on_processing_complete`` override below
-        # once the agent run actually finishes (``handle_message`` itself is
-        # fire-and-forget: it spawns ``_process_message_background`` and
-        # returns before the run starts, so nothing can be closed here).
+        try:
+            startup_handled = await self._preflight_startup_gate(event)
+        except Exception:
+            self._delivery_info.pop(session_chat_id, None)
+            self._delivery_info_created.pop(session_chat_id, None)
+            logger.exception(
+                "[webhook] startup admission failed for delivery %s",
+                delivery_id,
+            )
+            return web.json_response(
+                {"status": "error", "error": "Admission failed"},
+                status=503,
+            )
+
+        if not self._record_delivery_id(delivery_id, now):
+            logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
+            return web.json_response(
+                {"status": "duplicate", "delivery_id": delivery_id},
+                status=200,
+            )
+
+        if startup_handled:
+            self._delivery_info.pop(session_chat_id, None)
+            self._delivery_info_created.pop(session_chat_id, None)
+            return web.json_response(
+                {
+                    "status": "accepted",
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                },
+                status=202,
+            )
+
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)

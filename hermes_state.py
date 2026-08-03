@@ -5837,7 +5837,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         role: str,
-        content: str = None,
+        content: Optional[str] = None,
         tool_name: str = None,
         tool_calls: Any = None,
         tool_call_id: str = None,
@@ -7346,6 +7346,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SELECT 1 FROM messages "
                 "WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
                 (session_id, platform_message_id),
+            )
+            return cursor.fetchone() is not None
+
+    def has_platform_message_id_for_session_key(
+        self,
+        session_key: str,
+        platform_message_id: str,
+    ) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(  # ty:ignore[unresolved-attribute]
+                "SELECT 1 FROM sessions s "
+                "JOIN messages m ON m.session_id = s.id "
+                "WHERE s.session_key = ? AND m.platform_message_id = ? LIMIT 1",
+                (session_key, platform_message_id),
             )
             return cursor.fetchone() is not None
 

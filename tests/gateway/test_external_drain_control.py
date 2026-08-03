@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -142,6 +142,19 @@ def _drain_runner():
 class TestDrainStateMachine:
 
 
+    def test_enter_steers_active_agent_with_concise_maintenance_event(self):
+        runner, _ = _drain_runner()
+        agent = MagicMock()
+        agent.steer.return_value = True
+        runner._running_agents = {"telegram:chat:topic": agent}
+
+        runner._enter_external_drain()
+
+        note = agent.steer.call_args.args[0]
+        assert "Maintenance is pending" in note
+        assert "avoid starting new delegated work" in note
+        assert "exact next action and blockers" in note
+
     def test_enter_idempotent(self):
         runner, _ = _drain_runner()
         runner._enter_external_drain()
@@ -198,9 +211,10 @@ class TestDrainWatcher:
 
 class TestNewTurnGate:
     @pytest.mark.asyncio
-    async def test_new_turn_refused_during_external_drain(self):
+    async def test_new_turn_is_durably_queued_during_external_drain(self):
         runner, _ = _drain_runner()
         runner._external_drain_active = True
+        runner._persist_drain_event = AsyncMock(return_value=True)
         event = MessageEvent(
             text="hello",
             message_type=MessageType.TEXT,
@@ -209,5 +223,6 @@ class TestNewTurnGate:
         )
         result = await runner._handle_message(event)
         assert result is not None
-        assert "draining" in result.lower()
+        assert "saved this message" in result.lower()
+        runner._persist_drain_event.assert_awaited_once()
 
